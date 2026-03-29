@@ -477,11 +477,10 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        # Check for explicit memory save request before normal processing
-        has_trigger, fact = self.memory_consolidator.store.has_explicit_memory_request(msg.content)
-        if has_trigger and fact:
-            logger.info("Detected explicit memory request: {}", fact[:100])
-            await self.memory_consolidator.store.save_explicit_fact(fact, self.provider, self.model)
+        # Check for explicit memory save requests
+        has_trigger, extracted_fact = self.memory_consolidator.store.has_explicit_memory_request(
+            msg.content
+        )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -527,6 +526,17 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+
+        # Save explicit memory facts if requested by user
+        if has_trigger and extracted_fact:
+            self._schedule_background(
+                self.memory_consolidator.store.save_explicit_fact(
+                    extracted_fact,
+                    self.memory_consolidator.provider,
+                    self.memory_consolidator.model,
+                )
+            )
+
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:

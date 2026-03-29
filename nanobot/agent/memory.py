@@ -147,18 +147,10 @@ class MemoryStore:
         provider: LLMProvider,
         model: str,
     ) -> bool:
-        """Consolidate messages into HISTORY.md only (no more auto MEMORY.md updates).
+        """Consolidate messages into HISTORY.md only (no auto MEMORY.md updates).
 
         This creates a grep-searchable chronological log entry.
         MEMORY.md is now updated ONLY via explicit user requests through save_explicit_fact().
-
-        Args:
-            messages: Conversation messages to summarize
-            provider: LLM provider for summarization
-            model: Model name to use
-
-        Returns:
-            True if successfully archived (including raw fallback), False only on unrecoverable failure
         """
         if not messages:
             return True
@@ -173,7 +165,10 @@ Conversation:
 {formatted}"""
 
         chat_messages = [
-            {"role": "system", "content": "Summarize conversations for a chronological log."},
+            {
+                "role": "system",
+                "content": "You are a history summarization agent. Return ONLY the summary paragraph.",
+            },
             {"role": "user", "content": prompt},
         ]
 
@@ -183,41 +178,23 @@ Conversation:
                 model=model,
             )
 
-            if response.finish_reason != "error" and response.content:
-                entry = response.content.strip()
+            if response.finish_reason == "error":
+                return self._fail_or_raw_archive(messages)
 
-                if not entry.startswith("["):
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    entry = f"[{ts}] {entry}"
+            entry = (response.content or "").strip()
+            if not entry:
+                return self._fail_or_raw_archive(messages)
 
-                self.append_history(entry)
-                logger.info("Consolidated {} messages to HISTORY.md", len(messages))
-                return True
-
-            return self._fail_or_raw_archive(messages)
+            self.append_history(entry)
+            self._consecutive_failures = 0
+            logger.info("Memory consolidation done for {} messages", len(messages))
+            return True
 
         except Exception:
             logger.exception("Memory consolidation failed")
             return self._fail_or_raw_archive(messages)
 
-    def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
-        """Increment failure count; after threshold, raw-archive messages and return True."""
-        self._consecutive_failures += 1
-        if self._consecutive_failures < self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
-            return False
-        self._raw_archive(messages)
-        self._consecutive_failures = 0
-        return True
-
-    def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
-        )
-        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
-
-    async def save_explicit_fact(self, fact: str, provider: "LLMProvider", model: str) -> bool:
+    async def save_explicit_fact(self, fact: str, provider: LLMProvider, model: str) -> bool:
         """Save a specific fact directly to MEMORY.md via LLM formatting.
 
         Args:
@@ -253,17 +230,37 @@ Return ONLY the complete updated MEMORY.md content with the new fact integrated 
                 model=model,
             )
 
-            if response.finish_reason != "error" and response.content:
-                self.write_long_term(response.content.strip())
-                logger.info("Saved explicit fact to MEMORY.md: {}", fact[:100])
+            if response.finish_reason == "error" or not response.content:
+                logger.warning("Failed to format explicit memory fact")
+                return False
+
+            updated_memory = response.content.strip()
+            if updated_memory:
+                self.write_long_term(updated_memory)
+                logger.info("Explicit fact saved to MEMORY.md")
                 return True
 
-            logger.warning("Failed to save explicit fact: no valid response from LLM")
-            return False
-
         except Exception:
-            logger.exception("Failed to save explicit memory fact: {}", fact)
+            logger.exception("save_explicit_fact failed")
+
+        return False
+
+    def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
+        """Increment failure count; after threshold, raw-archive messages and return True."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures < self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
             return False
+        self._raw_archive(messages)
+        self._consecutive_failures = 0
+        return True
+
+    def _raw_archive(self, messages: list[dict]) -> None:
+        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.append_history(
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
+        )
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
 
 
 class MemoryConsolidator:
