@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,7 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
 
+
 _TOOL_CHOICE_ERROR_MARKERS = (
     "tool_choice",
     "toolchoice",
@@ -76,6 +78,14 @@ class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
     _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+
+    EXPLICIT_MEMORY_TRIGGERS = [
+        "remember",
+        "save to memory",
+        "store this",
+        "add to my memory",
+        "keep in mind",
+    ]
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
@@ -99,13 +109,33 @@ class MemoryStore:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
+    def has_explicit_memory_request(self, message: str) -> tuple[bool, str]:
+        """Check if user explicitly wants to save something to MEMORY.md.
+
+        Returns:
+            (has_trigger, extracted_fact) - fact is empty string if no trigger found
+        """
+        msg_lower = message.lower()
+
+        for trigger in self.EXPLICIT_MEMORY_TRIGGERS:
+            if trigger in msg_lower:
+                idx = msg_lower.find(trigger)
+                fact = message[idx + len(trigger) :].strip()
+                fact = re.sub(r"^[,:]+", "", fact).strip()
+                fact = re.sub(r"^(this|that)\s+", "", fact, flags=re.IGNORECASE).strip()
+                return True, fact
+
+        return False, ""
+
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
         lines = []
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            )
             lines.append(
                 f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
             )
@@ -117,83 +147,55 @@ class MemoryStore:
         provider: LLMProvider,
         model: str,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
+        """Consolidate messages into HISTORY.md only (no more auto MEMORY.md updates).
+
+        This creates a grep-searchable chronological log entry.
+        MEMORY.md is now updated ONLY via explicit user requests through save_explicit_fact().
+
+        Args:
+            messages: Conversation messages to summarize
+            provider: LLM provider for summarization
+            model: Model name to use
+
+        Returns:
+            True if successfully archived (including raw fallback), False only on unrecoverable failure
+        """
         if not messages:
             return True
 
-        current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+        formatted = self._format_messages(messages)
 
-## Current Long-term Memory
-{current_memory or "(empty)"}
+        prompt = f"""Summarize this conversation into a single paragraph for the history log.
+Start with [YYYY-MM-DD HH:MM] timestamp. Include key topics/decisions/actions.
+Make it grep-searchable with specific details.
 
-## Conversation to Process
-{self._format_messages(messages)}"""
+Conversation:
+{formatted}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {"role": "system", "content": "Summarize conversations for a chronological log."},
             {"role": "user", "content": prompt},
         ]
 
         try:
-            forced = {"type": "function", "function": {"name": "save_memory"}}
             response = await provider.chat_with_retry(
                 messages=chat_messages,
-                tools=_SAVE_MEMORY_TOOL,
                 model=model,
-                tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
-                logger.warning("Forced tool_choice unsupported, retrying with auto")
-                response = await provider.chat_with_retry(
-                    messages=chat_messages,
-                    tools=_SAVE_MEMORY_TOOL,
-                    model=model,
-                    tool_choice="auto",
-                )
+            if response.finish_reason != "error" and response.content:
+                entry = response.content.strip()
 
-            if not response.has_tool_calls:
-                logger.warning(
-                    "Memory consolidation: LLM did not call save_memory "
-                    "(finish_reason={}, content_len={}, content_preview={})",
-                    response.finish_reason,
-                    len(response.content or ""),
-                    (response.content or "")[:200],
-                )
-                return self._fail_or_raw_archive(messages)
+                if not entry.startswith("["):
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    entry = f"[{ts}] {entry}"
 
-            args = _normalize_save_memory_args(response.tool_calls[0].arguments)
-            if args is None:
-                logger.warning("Memory consolidation: unexpected save_memory arguments")
-                return self._fail_or_raw_archive(messages)
+                self.append_history(entry)
+                logger.info("Consolidated {} messages to HISTORY.md", len(messages))
+                return True
 
-            if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
-                return self._fail_or_raw_archive(messages)
+            return self._fail_or_raw_archive(messages)
 
-            entry = args["history_entry"]
-            update = args["memory_update"]
-
-            if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
-                return self._fail_or_raw_archive(messages)
-
-            entry = _ensure_text(entry).strip()
-            if not entry:
-                logger.warning("Memory consolidation: history_entry is empty after normalization")
-                return self._fail_or_raw_archive(messages)
-
-            self.append_history(entry)
-            update = _ensure_text(update)
-            if update != current_memory:
-                self.write_long_term(update)
-
-            self._consecutive_failures = 0
-            logger.info("Memory consolidation done for {} messages", len(messages))
-            return True
         except Exception:
             logger.exception("Memory consolidation failed")
             return self._fail_or_raw_archive(messages)
@@ -211,12 +213,57 @@ class MemoryStore:
         """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
         )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
+
+    async def save_explicit_fact(self, fact: str, provider: "LLMProvider", model: str) -> bool:
+        """Save a specific fact directly to MEMORY.md via LLM formatting.
+
+        Args:
+            fact: The user's fact to store
+            provider: LLM provider for formatting
+            model: Model name to use
+
+        Returns:
+            True if successfully saved, False otherwise
+        """
+        current_memory = self.read_long_term()
+
+        prompt = f"""Integrate this new fact into my long-term memory.
+
+New fact to add: {fact}
+
+Current memory:
+{current_memory or "(empty)"}
+
+Return ONLY the complete updated MEMORY.md content with the new fact integrated naturally. Keep it concise and well-organized as markdown."""
+
+        chat_messages = [
+            {
+                "role": "system",
+                "content": "You help organize long-term user memory. Return only the updated markdown.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await provider.chat_with_retry(
+                messages=chat_messages,
+                model=model,
+            )
+
+            if response.finish_reason != "error" and response.content:
+                self.write_long_term(response.content.strip())
+                logger.info("Saved explicit fact to MEMORY.md: {}", fact[:100])
+                return True
+
+            logger.warning("Failed to save explicit fact: no valid response from LLM")
+            return False
+
+        except Exception:
+            logger.exception("Failed to save explicit memory fact: {}", fact)
+            return False
 
 
 class MemoryConsolidator:
@@ -280,7 +327,7 @@ class MemoryConsolidator:
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -343,7 +390,7 @@ class MemoryConsolidator:
                     return
 
                 end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
+                chunk = session.messages[session.last_consolidated : end_idx]
                 if not chunk:
                     return
 
