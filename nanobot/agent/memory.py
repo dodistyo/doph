@@ -181,13 +181,9 @@ Conversation:
             if response.finish_reason == "error":
                 return self._fail_or_raw_archive(messages)
 
-            entry = (response.content or "").strip()
-            if not entry:
-                return self._fail_or_raw_archive(messages)
-
-            self.append_history(entry)
+            # Auto-history disabled - only explicit MEMORY.md saves now
             self._consecutive_failures = 0
-            logger.info("Memory consolidation done for {} messages", len(messages))
+            logger.debug("Skipped auto-history consolidation for {} messages", len(messages))
             return True
 
         except Exception:
@@ -255,12 +251,8 @@ Return ONLY the complete updated MEMORY.md content with the new fact integrated 
         return True
 
     def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
-        )
-        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
+        """Fallback: no longer writes to HISTORY.md (auto-history disabled)."""
+        logger.debug("Skipped raw archive for {} messages (auto-history disabled)", len(messages))
 
 
 class MemoryConsolidator:
